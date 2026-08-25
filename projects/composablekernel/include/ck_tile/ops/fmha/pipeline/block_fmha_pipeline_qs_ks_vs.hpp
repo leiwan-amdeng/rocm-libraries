@@ -55,6 +55,7 @@ struct BlockFmhaPipelineQSKSVS
     static constexpr auto BiasEnum          = Problem::BiasEnum;
     static constexpr bool kStoreLSE         = Problem::kStoreLSE;
     static constexpr bool kHasDropout       = Problem::kHasDropout;
+    static constexpr bool kHasSink          = Problem::kHasSink;
 
     static_assert((CK_TILE_FMHA_FWD_FAST_EXP2 &&
                    (kHasLogitsSoftCap && Problem::BiasEnum == BlockAttentionBiasEnum::NO_BIAS ||

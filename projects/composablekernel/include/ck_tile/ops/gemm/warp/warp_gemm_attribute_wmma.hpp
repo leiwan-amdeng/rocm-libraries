@@ -81,11 +81,11 @@ struct BWarpDstrEncodingTrait
     static constexpr auto get_encoding()
     {
         if constexpr(AttrNumAccessV == 0)
-        {
+        {   // 
             return tile_distribution_encoding<
                 sequence<Impl::kRepeat>,
-                tuple<sequence<Impl::kBNBlock, Impl::kBNLane>,
-                      sequence<Impl::kBK0PerLane, Impl::kABKLane, Impl::kBK1PerLane>>,
+                tuple<sequence<Impl::kBNBlock, Impl::kBNLane>, // 1  16
+                      sequence<Impl::kBK0PerLane, Impl::kABKLane, Impl::kBK1PerLane>>, //  4 1  16
                 tuple<typename Impl::kABPs2RHssMajor>,
                 tuple<typename Impl::kABPs2RHssMinor>,
                 typename Impl::kABYs2RHsMajor,

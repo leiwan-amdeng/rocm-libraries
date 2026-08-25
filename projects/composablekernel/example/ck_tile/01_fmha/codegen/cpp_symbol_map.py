@@ -138,7 +138,7 @@ MODE_MAP = {"batch": "false", "group": "true"}
 LAYOUT_MAP = {"row": "true", "col": "false"}
 
 PIPELINE_MAP = {
-    "qr": "ck_tile::BlockFmhaPipelineQRKSVS",
+    "qr": "ck_tile::BlockFmhaPipelineQRKSVSDenseOnly",
     "qr_hpad": "ck_tile::BlockFmhaPipelineQRKSVSHpad",
     "qr_async": "ck_tile::BlockFmhaPipelineQRKSVSAsync",
     "qs": "ck_tile::BlockFmhaPipelineQSKSVS",

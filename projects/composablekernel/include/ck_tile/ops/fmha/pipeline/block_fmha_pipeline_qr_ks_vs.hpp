@@ -865,7 +865,7 @@ struct BlockFmhaPipelineQRKSVS
             // P*V GEMM. Disable skip for all FP8 paths (threshold 0).
             static constexpr SMPLComputeDataType kRescaleThreshold =
                 type_convert<SMPLComputeDataType>(
-                    QScaleEnum == BlockAttentionQuantScaleEnum::NO_SCALE ? 8.0f : 0.0f);
+                    QScaleEnum == BlockAttentionQuantScaleEnum::NO_SCALE ? 5.0f : 0.0f);
 
             // Per-row stabilizer: m_old for skip rows, m_j for rescale rows.
             auto m_stab =

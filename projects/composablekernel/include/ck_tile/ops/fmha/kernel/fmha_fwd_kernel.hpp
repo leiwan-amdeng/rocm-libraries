@@ -1344,29 +1344,27 @@ struct FmhaFwdKernel
             head_start);
     }
 
+#ifndef CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH
+#define CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH 1
+#endif
+
     CK_TILE_HOST static constexpr auto GridSize(ck_tile::index_t batch_size_,
                                                 ck_tile::index_t nhead_,
                                                 ck_tile::index_t seqlen_q_,
                                                 ck_tile::index_t hdim_v_,
                                                 bool has_padded_seqlen_k = false)
     {
-        // has_padded_seqlen_k is determined by checking (seqlen_k_ptr != nullptr)
-        if(has_padded_seqlen_k)
-        {
-            // TODO: this may need tuning
-            return dim3(nhead_,
-                        batch_size_,
-                        ck_tile::integer_divide_ceil(seqlen_q_, FmhaPipeline::kM0) *
-                            ck_tile::integer_divide_ceil(hdim_v_, FmhaPipeline::kN1));
-        }
-        else
-        {
-            // TODO: this may need tuning
-            return dim3(nhead_,
-                        ck_tile::integer_divide_ceil(seqlen_q_, FmhaPipeline::kM0) *
-                            ck_tile::integer_divide_ceil(hdim_v_, FmhaPipeline::kN1),
-                        batch_size_);
-        }
+        (void)has_padded_seqlen_k;
+        // Launch order is x -> y -> z. Put sequence/query tiles in x so adjacent blocks
+        // walk the same KV tile in the kv loop. This experiment puts head in y and batch in z
+        // so the launch mapping is (sequence/query tile, head, batch).
+        // has_padded_seqlen_k is determined by checking (seqlen_k_ptr != nullptr); the
+        // logical mapping stays the same for both padded and non-padded launches.
+        const index_t num_tile_total =
+            ck_tile::integer_divide_ceil(seqlen_q_, FmhaPipeline::kM0) *
+            ck_tile::integer_divide_ceil(hdim_v_, FmhaPipeline::kN1);
+        return CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH ? dim3(num_tile_total, nhead_, batch_size_) :
+                                                    dim3(num_tile_total, batch_size_, nhead_);
     }
 
     CK_TILE_DEVICE static constexpr auto GetTileIndex(const Kargs& kargs)
@@ -1400,24 +1398,19 @@ struct FmhaFwdKernel
             {
                 const index_t num_tile_n1 =
                     ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
-                const index_t num_tile_total   = has_padded_seqlen_k ? gridDim.z : gridDim.y;
-                const index_t num_head         = gridDim.x;
-                const index_t blocks_per_batch = num_head * num_tile_total;
-                const index_t linear_id =
-                    blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
 
-                const index_t i_batch = linear_id / blocks_per_batch;
-                const index_t rem0    = linear_id - i_batch * blocks_per_batch;
-                const index_t i_nhead = rem0 / num_tile_total;
-                const index_t i_block = rem0 - i_nhead * num_tile_total;
+                const index_t i_block = blockIdx.x;
+                const index_t i_nhead = CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH ? blockIdx.y : blockIdx.z;
+                const index_t i_batch = CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH ? blockIdx.z : blockIdx.y;
 
                 index_t i_tile_m = i_block / num_tile_n1;
                 index_t i_tile_n = i_block - i_tile_m * num_tile_n1;
 
                 if constexpr(kHasMask)
                 {
-                    const index_t num_tile_m = num_tile_total / num_tile_n1;
-                    i_tile_m                 = num_tile_m - 1 - i_tile_m;
+                    const index_t num_tile_total = gridDim.x;
+                    const index_t num_tile_m     = num_tile_total / num_tile_n1;
+                    i_tile_m                     = num_tile_m - 1 - i_tile_m;
                 }
                 return ck_tile::make_tuple(i_tile_m, i_tile_n, i_nhead, i_batch);
             }
@@ -1430,9 +1423,9 @@ struct FmhaFwdKernel
             const index_t num_tile_n1 =
                 ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
 
-            const index_t i_block = blockIdx.z;
-            const index_t i_nhead = blockIdx.x;
-            const index_t i_batch = blockIdx.y;
+            const index_t i_block = blockIdx.x;
+            const index_t i_nhead = CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH ? blockIdx.y : blockIdx.z;
+            const index_t i_batch = CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH ? blockIdx.z : blockIdx.y;
 
             const auto f = [](index_t dividend, index_t divisor) {
                 index_t quotient = dividend / divisor;
@@ -1446,7 +1439,7 @@ struct FmhaFwdKernel
             {
                 // assume that num_tile_n1 is always 1
                 return ck_tile::make_tuple(
-                    static_cast<index_t>(gridDim.z) - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
+                    static_cast<index_t>(gridDim.x) - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
             }
             else
             {
@@ -1459,9 +1452,9 @@ struct FmhaFwdKernel
             const index_t num_tile_n1 =
                 ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
 
-            const index_t i_block = blockIdx.y; // blockIdx.x
-            const index_t i_nhead = blockIdx.x; // blockIdx.y
-            const index_t i_batch = blockIdx.z;
+            const index_t i_block = blockIdx.x;
+            const index_t i_nhead = CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH ? blockIdx.y : blockIdx.z;
+            const index_t i_batch = CK_TILE_FMHA_GRID_SEQ_HEAD_BATCH ? blockIdx.z : blockIdx.y;
 
             const auto f = [](index_t dividend, index_t divisor) {
                 index_t quotient = dividend / divisor;
@@ -1475,7 +1468,7 @@ struct FmhaFwdKernel
             {
                 // assume that num_tile_n1 is always 1
                 return ck_tile::make_tuple(
-                    static_cast<index_t>(gridDim.y) - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
+                    static_cast<index_t>(gridDim.x) - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
             }
             else
             {
@@ -1514,7 +1507,7 @@ struct FmhaFwdKernel
         // transpose) -- its pipeline expects the else-branch layout. Without
         // this guard, qr_tdm wrongly falls into the standard transposed path
         // and PV computes garbage output.
-        if constexpr(kPipelineName != "qr_async_trload" && kPipelineName != "qr_tdm")
+        //if constexpr(true) // HERMES_SIMPLIFIED_CURRENT_BRANCH: keep standard qr/qr_dense_only ntrload branch only
         {
             // allocate LDS
             __shared__ char smem_ptr[GetSmemSize()];
@@ -1526,161 +1519,45 @@ struct FmhaFwdKernel
             long_index_t batch_offset_q         = 0;
             long_index_t batch_offset_k         = 0;
             long_index_t batch_offset_v         = 0;
-            long_index_t batch_offset_bias      = 0;
-            long_index_t batch_offset_randval   = 0;
-            long_index_t batch_offset_lse       = 0;
+            //long_index_t batch_offset_bias      = 0;
+            //long_index_t batch_offset_randval   = 0;
+            //long_index_t batch_offset_lse       = 0;
             long_index_t batch_offset_o         = 0;
-            long_index_t batch_offset_q_descale = 0;
-            long_index_t batch_offset_k_descale = 0;
-            long_index_t batch_offset_v_descale = 0;
-            float sink_value                    = -numeric<float>::infinity();
-            if constexpr(kHasMask && !kHasSink)
-            {
-                sink_value = -numeric<float>::infinity();
-            }
-            else
-            {
-                sink_value =
-                    kargs.sink_ptr != nullptr
-                        ? (*(static_cast<const float*>(kargs.sink_ptr) + i_nhead)) / kargs.scale_s
-                        : -numeric<float>::infinity();
-            }
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: current kernel is nmask + nsink + nqscale.
+            float sink_value = -numeric<float>::infinity();
 
-            if constexpr(kIsGroupMode)
-            {
-                // Use seqstart_q_ptr and seqstart_k_ptr for physical starts
-                const long_index_t query_start = kargs.seqstart_q_ptr[i_batch];
-                const long_index_t key_start   = kargs.seqstart_k_ptr[i_batch];
-
-                // DRAM base offsets use physical starts
-                batch_offset_q = query_start * kargs.stride_q;
-                batch_offset_k = key_start * kargs.stride_k;
-                if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
-                {
-                    batch_offset_v = key_start * kargs.stride_v;
-                }
-                else
-                {
-                    batch_offset_v = key_start;
-                }
-                if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
-                {
-                    batch_offset_bias = query_start * kargs.stride_bias;
-                }
-                if constexpr(kStoreLSE)
-                {
-                    // LSE follows the physical layout to stay consistent with other tensors
-                    batch_offset_lse = query_start;
-                }
-                if constexpr(kHasDropout)
-                {
-                    batch_offset_randval = query_start * kargs.stride_randval;
-                }
-                if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)
-                {
-                    const long_index_t bquery_start = kargs.block_scale_seqstart_q_ptr[i_batch];
-                    const long_index_t bkey_start   = kargs.block_scale_seqstart_k_ptr[i_batch];
-                    batch_offset_q_descale          = bquery_start;
-                    batch_offset_k_descale          = bkey_start;
-                    batch_offset_v_descale          = bkey_start;
-                }
-                else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::MX)
-                {
-                    batch_offset_q_descale = query_start * kargs.stride_q_descale;
-                    batch_offset_k_descale = key_start * kargs.stride_k_descale;
-                    batch_offset_v_descale = kargs.seqstart_v_scale_ptr[i_batch];
-                }
-                batch_offset_o = query_start * kargs.stride_o;
-
-                // real logical lengths (exclude PAD)
-                // Priority: seqlen_q_ptr > cu_seqlen_q_ptr > calculated from seqstart_q_ptr
-                if(kargs.seqlen_q_ptr != nullptr)
-                {
-                    kargs.seqlen_q = kargs.seqlen_q_ptr[i_batch];
-                }
-                else if(kargs.cu_seqlen_q_ptr != nullptr)
-                {
-                    kargs.seqlen_q =
-                        kargs.cu_seqlen_q_ptr[i_batch + 1] - kargs.cu_seqlen_q_ptr[i_batch];
-                }
-                else
-                {
-                    const auto adjusted_seqstart_q_ptr = kargs.seqstart_q_ptr + i_batch;
-                    kargs.seqlen_q = adjusted_seqstart_q_ptr[1] - adjusted_seqstart_q_ptr[0];
-                }
-
-                if constexpr(kSkipMinSeqlenQ)
-                {
-                    if(kargs.seqlen_q <= kargs.min_seqlen_q)
-                    {
-                        return;
-                    }
-                }
-
-                // terminate unnecessary blocks earlier
-                if(kargs.seqlen_q <= i_m0)
-                {
-                    return;
-                }
-
-                if(kargs.seqlen_k_ptr != nullptr)
-                {
-                    kargs.seqlen_k = kargs.seqlen_k_ptr[i_batch];
-                }
-                else if(kargs.cu_seqlen_k_ptr != nullptr)
-                {
-                    kargs.seqlen_k =
-                        kargs.cu_seqlen_k_ptr[i_batch + 1] - kargs.cu_seqlen_k_ptr[i_batch];
-                }
-                else
-                {
-                    const auto adjusted_seqstart_k_ptr = kargs.seqstart_k_ptr + i_batch;
-                    kargs.seqlen_k = adjusted_seqstart_k_ptr[1] - adjusted_seqstart_k_ptr[0];
-                }
-            }
-            else
-            {
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: batch-mode offset path only; group/varlen branch removed.
                 batch_offset_q = static_cast<long_index_t>(i_batch) * kargs.batch_stride_q;
                 batch_offset_k = static_cast<long_index_t>(i_batch) * kargs.batch_stride_k;
                 batch_offset_v = static_cast<long_index_t>(i_batch) * kargs.batch_stride_v;
-                if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
-                {
-                    batch_offset_bias =
-                        static_cast<long_index_t>(i_batch) * kargs.batch_stride_bias;
-                }
-                if constexpr(kStoreLSE)
-                {
-                    batch_offset_lse = static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse;
-                }
-                if constexpr(kHasDropout)
-                {
-                    batch_offset_randval =
-                        static_cast<long_index_t>(i_batch) * kargs.batch_stride_randval;
-                }
-                if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE ||
-                             QScaleEnum == BlockAttentionQuantScaleEnum::MX)
-                {
-                    batch_offset_q_descale =
-                        static_cast<long_index_t>(i_batch) * kargs.batch_stride_q_descale;
-                    batch_offset_k_descale =
-                        static_cast<long_index_t>(i_batch) * kargs.batch_stride_k_descale;
-                    batch_offset_v_descale =
-                        static_cast<long_index_t>(i_batch) * kargs.batch_stride_v_descale;
-                }
+                // if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
+                // {
+                //     batch_offset_bias =
+                //         static_cast<long_index_t>(i_batch) * kargs.batch_stride_bias;
+                // }
+                // if constexpr(kStoreLSE)
+                // {
+                //     batch_offset_lse = static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse;
+                // }
+                // if constexpr(kHasDropout)
+                // {
+                //     batch_offset_randval =
+                //         static_cast<long_index_t>(i_batch) * kargs.batch_stride_randval;
+                // }
                 batch_offset_o = static_cast<long_index_t>(i_batch) * kargs.batch_stride_o;
 
                 // If cumulative seqlen pointers are provided, override per-batch effective lengths
-                if(kargs.cu_seqlen_q_ptr != nullptr)
-                {
-                    kargs.seqlen_q =
-                        kargs.cu_seqlen_q_ptr[i_batch + 1] - kargs.cu_seqlen_q_ptr[i_batch];
-                }
-                if(kargs.cu_seqlen_k_ptr != nullptr)
-                {
-                    kargs.seqlen_k =
-                        kargs.cu_seqlen_k_ptr[i_batch + 1] - kargs.cu_seqlen_k_ptr[i_batch];
-                }
-            }
+                // if(kargs.cu_seqlen_q_ptr != nullptr)
+                // {
+                //     kargs.seqlen_q =
+                //         kargs.cu_seqlen_q_ptr[i_batch + 1] - kargs.cu_seqlen_q_ptr[i_batch];
+                // }
+                // if(kargs.cu_seqlen_k_ptr != nullptr)
+                // {
+                //     kargs.seqlen_k =
+                //         kargs.cu_seqlen_k_ptr[i_batch + 1] - kargs.cu_seqlen_k_ptr[i_batch];
+                // }
+            
 
             // for simplicity, batch stride we just modify the pointer
             const index_t i_nhead_k = i_nhead / kargs.nhead_ratio_qk;
@@ -1706,614 +1583,115 @@ struct FmhaFwdKernel
                                                     : FmhaPipeline::kSubQKHeaddim;
 
             // Q/K/V DRAM and DRAM window
-            const auto q_dram = [&]() {
-                const auto q_dram_naive = make_naive_tensor_view<address_space_enum::global>(
-                    q_ptr,
-                    make_tuple(kargs.seqlen_q, kargs.hdim_q),
-                    make_tuple(kargs.stride_q, 1),
-                    number<FmhaPipeline::kAlignmentQ>{},
-                    number<1>{});
-                if constexpr(FmhaPipeline::kQLoadOnce)
-                {
-                    return pad_tensor_view(
-                        q_dram_naive,
-                        make_tuple(number<FmhaPipeline::kM0>{}, number<kQKHeaddimToUse>{}),
-                        sequence<kPadSeqLenQ, kPadHeadDimQ>{});
-                }
-                else
-                {
-                    return pad_tensor_view(
-                        q_dram_naive,
-                        make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kK0>{}),
-                        sequence<kPadSeqLenQ, kPadHeadDimQ>{});
-                }
-            }();
-            const auto k_dram = [&]() {
-                const auto k_dram_naive = make_naive_tensor_view<address_space_enum::global>(
-                    k_ptr,
-                    make_tuple(kargs.seqlen_k, kargs.hdim_q),
-                    make_tuple(kargs.stride_k, 1),
-                    number<FmhaPipeline::kAlignmentK>{},
-                    number<1>{});
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: Q DRAM for kQLoadOnce=true path.
+            const auto q_dram_naive = make_naive_tensor_view<address_space_enum::global>(
+                q_ptr,
+                make_tuple(kargs.seqlen_q, kargs.hdim_q),
+                make_tuple(kargs.stride_q, 1),
+                number<FmhaPipeline::kAlignmentQ>{},
+                number<1>{});
+            const auto q_dram = pad_tensor_view(
+                q_dram_naive,
+                make_tuple(number<FmhaPipeline::kM0>{}, number<kQKHeaddimToUse>{}),
+                sequence<kPadSeqLenQ, kPadHeadDimQ>{});
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: K DRAM for normal non-n0loop path.
+            const auto k_dram_naive = make_naive_tensor_view<address_space_enum::global>(
+                k_ptr,
+                make_tuple(kargs.seqlen_k, kargs.hdim_q),
+                make_tuple(kargs.stride_k, 1),
+                number<FmhaPipeline::kAlignmentK>{},
+                number<1>{});
 
-                constexpr bool kPadSeqLenK_ = kUseAsyncCopy ? kPadSeqLenK : false;
+            constexpr bool kPadSeqLenK_ = kUseAsyncCopy ? kPadSeqLenK : false;
+            const auto k_dram = pad_tensor_view(
+                k_dram_naive,
+                make_tuple(number<FmhaPipeline::kN0>{}, number<FmhaPipeline::kK0>{}),
+                sequence<kPadSeqLenK_, kPadHeadDimQ>{});
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: current kernel is _vr_ + ntrload.
+            // V naive view is [seqlen_k, hdim_v] with strides [stride_v, 1],
+            // then transformed to PV logical [hdim_v, seqlen_k].
+            const auto v_dram_naive = make_naive_tensor_view<address_space_enum::global>(
+                v_ptr,
+                make_tuple(kargs.seqlen_k, kargs.hdim_v),
+                make_tuple(kargs.stride_v, 1),
+                number<FmhaPipeline::kAlignmentV>{},
+                number<1>{});
 
-                if constexpr(detail::is_n0loop_pipeline_v<FmhaPipeline>)
-                {
-                    return pad_tensor_view(
-                        k_dram_naive,
-                        make_tuple(number<FmhaPipeline::kN0Sub>{}, number<kQKHeaddimToUse>{}),
-                        sequence<kPadSeqLenK_, kPadHeadDimQ>{});
-                }
-                else
-                {
-                    return pad_tensor_view(
-                        k_dram_naive,
-                        make_tuple(number<FmhaPipeline::kN0>{}, number<FmhaPipeline::kK0>{}),
-                        sequence<kPadSeqLenK_, kPadHeadDimQ>{});
-                }
-            }();
-            const auto v_dram = [&]() {
-                if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
-                {
-                    const auto v_dram_naive = make_naive_tensor_view<address_space_enum::global>(
-                        v_ptr,
-                        make_tuple(kargs.seqlen_k, kargs.hdim_v),
-                        make_tuple(kargs.stride_v, 1),
-                        number<FmhaPipeline::kAlignmentV>{},
-                        number<1>{});
+            const auto v_dram_transposed = transform_tensor_view(
+                v_dram_naive,
+                make_tuple(make_pass_through_transform(kargs.hdim_v),
+                           make_pass_through_transform(kargs.seqlen_k)),
+                make_tuple(sequence<1>{}, sequence<0>{}),
+                make_tuple(sequence<0>{}, sequence<1>{}));
 
-                    if constexpr(!kUseTrLoad)
-                    {
-                        const auto v_dram_transposed = transform_tensor_view(
-                            v_dram_naive,
-                            make_tuple(make_pass_through_transform(kargs.hdim_v),
-                                       make_pass_through_transform(kargs.seqlen_k)),
-                            make_tuple(sequence<1>{}, sequence<0>{}),
-                            make_tuple(sequence<0>{}, sequence<1>{}));
+            constexpr bool kPadSeqLenKForV_ = kUseAsyncCopy ? kPadSeqLenK : false;
+            const auto v_dram = pad_tensor_view(
+                v_dram_transposed,
+                make_tuple(number<FmhaPipeline::kN1>{}, number<FmhaPipeline::kK1>{}),
+                sequence<kPadHeadDimV, kPadSeqLenKForV_>{});
 
-                        constexpr bool kPadSeqLenK_ = kUseAsyncCopy ? kPadSeqLenK : false;
-
-                        return pad_tensor_view(
-                            v_dram_transposed,
-                            make_tuple(number<FmhaPipeline::kN1>{}, number<FmhaPipeline::kK1>{}),
-                            sequence<kPadHeadDimV, kPadSeqLenK_>{});
-                    }
-                    else
-                    {
-                        return pad_tensor_view(
-                            v_dram_naive,
-                            make_tuple(number<FmhaPipeline::kK1>{}, number<FmhaPipeline::kN1>{}),
-                            sequence<false, kPadHeadDimV>{});
-                    };
-                }
-                else
-                {
-                    const auto v_dram_naive = make_naive_tensor_view<address_space_enum::global>(
-                        v_ptr,
-                        make_tuple(kargs.hdim_v, kargs.seqlen_k),
-                        make_tuple(kargs.stride_v, 1),
-                        number<FmhaPipeline::kAlignmentV>{},
-                        number<1>{});
-
-                    constexpr bool kPadHeadDimV_ = kUseAsyncCopy ? kPadHeadDimV : false;
-                    return pad_tensor_view(
-                        v_dram_naive,
-                        make_tuple(number<FmhaPipeline::kN1>{}, number<FmhaPipeline::kK1>{}),
-                        sequence<kPadHeadDimV_, kPadSeqLenK>{});
-                }
-            }();
-
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: current qr_dense_only path has kQLoadOnce=true.
             auto q_dram_window = make_tile_window(
                 q_dram,
-                [&]() {
-                    if constexpr(FmhaPipeline::kQLoadOnce)
-                        return make_tuple(number<FmhaPipeline::kM0>{}, number<kQKHeaddimToUse>{});
-                    else
-                        return make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kK0>{});
-                }(),
+                make_tuple(number<FmhaPipeline::kM0>{}, number<kQKHeaddimToUse>{}),
                 {i_m0, 0});
 
-            auto k_dram_window = [&]() {
-                if constexpr(detail::is_n0loop_pipeline_v<FmhaPipeline>)
-                {
-                    return make_tile_window(
-                        k_dram,
-                        make_tuple(number<FmhaPipeline::kN0Sub>{}, number<kQKHeaddimToUse>{}),
-                        {0, 0});
-                }
-                else
-                {
-                    return make_tile_window(
-                        k_dram,
-                        make_tuple(number<FmhaPipeline::kN0>{}, number<FmhaPipeline::kK0>{}),
-                        {0, 0});
-                }
-            }();
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: current qr_dense_only path is not n0loop.
+            auto k_dram_window = make_tile_window(
+                k_dram,
+                make_tuple(number<FmhaPipeline::kN0>{}, number<FmhaPipeline::kK0>{}),
+                {0, 0});
 
             auto v_dram_window = make_tile_window(
                 v_dram,
                 make_tuple(number<FmhaPipeline::kN1>{}, number<FmhaPipeline::kK1>{}),
                 {i_n1, 0});
-            /// FIXME: Before C++20, capturing structured binding variables are not supported.
-            /// Remove following copy capture of the 'i_nhead' if in C++20
-            const auto bias_dram_window = [&, i_nhead_ = i_nhead]() {
-                constexpr auto bias_dram_window_lengths =
-                    make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN0>{});
-                if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
-                {
-                    const BiasDataType* bias_ptr =
-                        reinterpret_cast<const BiasDataType*>(kargs.bias_ptr) +
-                        static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_bias +
-                        batch_offset_bias;
 
-                    const auto bias_dram = [&]() {
-                        const auto bias_dram_naive =
-                            make_naive_tensor_view<address_space_enum::global>(
-                                bias_ptr,
-                                make_tuple(kargs.seqlen_q, kargs.seqlen_k),
-                                make_tuple(kargs.stride_bias, 1),
-                                number<FmhaPipeline::kAlignmentBias>{},
-                                number<1>{});
-
-                        return pad_tensor_view(bias_dram_naive,
-                                               bias_dram_window_lengths,
-                                               sequence<kPadSeqLenQ, kPadSeqLenK>{});
-                    }();
-
-                    return make_tile_window(bias_dram, bias_dram_window_lengths, {i_m0, 0});
-                }
-                else
-                {
-                    return make_null_tile_window(bias_dram_window_lengths);
-                }
-            }();
-
-            // lse
-            auto lse_dram_window = [&, i_nhead_ = i_nhead]() {
-                constexpr auto lse_dram_window_lengths = make_tuple(number<FmhaPipeline::kM0>{});
-                if constexpr(kStoreLSE)
-                {
-                    LSEDataType* lse_ptr =
-                        reinterpret_cast<LSEDataType*>(kargs.lse_ptr) +
-                        static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_lse +
-                        batch_offset_lse;
-
-                    const auto lse_dram = [&]() {
-                        const auto lse_dram_naive =
-                            make_naive_tensor_view<address_space_enum::global>(
-                                lse_ptr,
-                                make_tuple(kargs.seqlen_q),
-                                make_tuple(1),
-                                number<1>{},
-                                number<1>{});
-
-                        return pad_tensor_view(
-                            lse_dram_naive, lse_dram_window_lengths, sequence<kPadSeqLenQ>{});
-                    }();
-
-                    return make_tile_window(lse_dram, lse_dram_window_lengths, {i_m0});
-                }
-                else
-                {
-                    return make_null_tile_window(lse_dram_window_lengths);
-                }
-            }();
-
-            auto dropout = [&, i_nhead_ = i_nhead, i_batch_ = i_batch]() {
-                if constexpr(kHasDropout)
-                {
-                    const auto num_head_q_total =
-                        (kargs.num_head_q_total > 0 ? kargs.num_head_q_total : kargs.num_head_q);
-                    const auto i_head_global = kargs.head_start + i_nhead_;
-                    return BlockDropout{i_batch_,
-                                        i_head_global,
-                                        num_head_q_total,
-                                        kargs.is_drop_seed_offset_from_host ? kargs.drop_seed.val
-                                                                            : *kargs.drop_seed.ptr,
-                                        kargs.is_drop_seed_offset_from_host
-                                            ? kargs.drop_offset.val
-                                            : *kargs.drop_offset.ptr,
-                                        kargs.rp_undrop,
-                                        kargs.p_undrop_in_uint8_t,
-                                        kargs.is_store_randval};
-                }
-                else
-                {
-                    return NullBlockDropout{};
-                };
-            }();
-
-            auto randval_dram_window = [&, i_nhead_ = i_nhead]() {
-                constexpr auto randval_dram_window_lengths =
-                    make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN0>{});
-                if constexpr(kHasDropout)
-                {
-                    RandValOutputDataType* rand_val_ptr =
-                        reinterpret_cast<RandValOutputDataType*>(kargs.rand_val_ptr) +
-                        static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_randval +
-                        batch_offset_randval;
-
-                    const auto randval_dram = [&]() {
-                        const auto randval_dram_naive =
-                            make_naive_tensor_view<address_space_enum::global>(
-                                rand_val_ptr,
-                                make_tuple(kargs.seqlen_q, kargs.seqlen_k),
-                                make_tuple(kargs.stride_randval, 1),
-                                number<FmhaPipeline::kAlignmentRandVal>{},
-                                number<1>{});
-
-                        return pad_tensor_view(randval_dram_naive,
-                                               randval_dram_window_lengths,
-                                               sequence<kPadSeqLenQ, kPadSeqLenK>{});
-                    }();
-
-                    return make_tile_window(randval_dram, randval_dram_window_lengths, {i_m0, 0});
-                }
-                else
-                {
-                    return make_null_tile_window(randval_dram_window_lengths);
-                }
-            }();
-
-            FmhaMask mask = [&]() {
-                if constexpr(kHasMask)
-                    return ck_tile::make_generic_attention_mask_from_lr_window<FmhaMask>(
-                        kargs.window_size_left,
-                        kargs.window_size_right,
-                        kargs.sink_size,
-                        kargs.seqlen_q,
-                        kargs.seqlen_k,
-                        kargs.mask_type == GenericAttentionMaskEnum::MASK_FROM_TOP_LEFT);
-                else
-                    return FmhaMask{kargs.seqlen_q, kargs.seqlen_k};
-            }();
-
-            // WA i_batch capture structure binding before c++20
-            auto position_encoding = [&, i_batch_ = i_batch, i_nhead_ = i_nhead]() {
-                if constexpr(BiasEnum == BlockAttentionBiasEnum::ALIBI)
-                {
-                    // data loading, shared by entire wg
-                    // TODO: how to use s_read?
-                    SaccDataType slope =
-                        *(reinterpret_cast<const SaccDataType*>(kargs.alibi_slope_ptr) +
-                          i_batch_ * kargs.alibi_slope_stride + i_nhead_);
-#if CK_TILE_FMHA_FWD_FAST_EXP2
-                    if constexpr(!detail::ignore_fast_exp2_v<FmhaPipeline>)
-                    {
-                        slope *= ck_tile::log2e_v<>;
-                    }
-#endif
-                    if constexpr(kHasMask)
-                    {
-                        return make_alibi_from_lr_mask<SaccDataType, true>(slope,
-                                                                           kargs.window_size_left,
-                                                                           kargs.window_size_right,
-                                                                           kargs.seqlen_q,
-                                                                           kargs.seqlen_k,
-                                                                           kargs.mask_type);
-                    }
-                    else
-                    {
-                        return Alibi<SaccDataType, true>{
-                            slope, kargs.seqlen_q, kargs.seqlen_k, AlibiMode::FROM_BOTTOM_RIGHT};
-                    }
-                }
-                else
-                {
-                    return EmptyPositionEncoding<SaccDataType>{};
-                }
-            }();
-
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: nmask/nbias/nlse/ndropout/no-position path.
+            // Keep the original pipeline signature, but pass null placeholders for the
+            // optional windows/objects that this specialized kernel never uses.
+            auto bias_dram_window = make_null_tile_window(
+                make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN0>{}));
+            auto randval_dram_window = make_null_tile_window(
+                make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN0>{}));
+            auto lse_dram_window = make_null_tile_window(make_tuple(number<FmhaPipeline::kM0>{}));
+            FmhaMask mask{kargs.seqlen_q, kargs.seqlen_k};
+            auto position_encoding = EmptyPositionEncoding<SaccDataType>{};
             AttentionVariant variant;
-            const auto variant_params = [&] {
-                const float scale_s = [&] {
-                    if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PERTENSOR)
-                    {
-                        float q_descale = *(reinterpret_cast<const float*>(kargs.q_descale_ptr));
-                        float k_descale = *(reinterpret_cast<const float*>(kargs.k_descale_ptr));
+            auto variant_params = ck_tile::StandardAttentionParams<FmhaMask>{mask, kargs.scale_s};
+            auto dropout = NullBlockDropout{};
 
-                        return kargs.scale_s * q_descale * k_descale;
-                    }
-                    else
-                    {
-                        return kargs.scale_s;
-                    }
-                }();
-
-                if constexpr(kHasLogitsSoftCap)
-                {
-                    return ck_tile::LogitsSoftCapParams<FmhaMask, CK_TILE_FMHA_FWD_FAST_EXP2>{
-                        mask, scale_s, kargs.logits_soft_cap, kargs.logits_soft_cap_rcp};
-                }
-                else
-                {
-                    return ck_tile::StandardAttentionParams<FmhaMask>{mask, scale_s};
-                }
-            }();
 
             BlockIndices block_indices{i_batch, i_nhead, i_nhead_k};
-            constexpr bool kPassHdimTailArgs = [] {
-                if constexpr(ck_tile::is_detected<has_hdim_tail_args, FmhaPipeline>::value)
-                    return static_cast<bool>(FmhaPipeline::kUseHdimTailArgs);
-                else
-                    return false;
-            }();
+            //constexpr bool kPassHdimTailArgs = false;
+            // [] {
+            //     if constexpr(ck_tile::is_detected<has_hdim_tail_args, FmhaPipeline>::value)
+            //         return static_cast<bool>(FmhaPipeline::kUseHdimTailArgs);
+            //     else
+            //         return false;
+            // }();
             auto invoke_fmha_pipeline = [&](auto&&... args) -> decltype(auto) {
-                if constexpr(kPassHdimTailArgs)
-                {
-                    const ck_tile::index_t valid_k0_loops =
-                        ck_tile::integer_divide_ceil(kargs.hdim_q, FmhaPipeline::kK0);
-                    const ck_tile::index_t valid_last_k0_length =
-                        kargs.hdim_q - (valid_k0_loops - 1) * FmhaPipeline::kK0;
-                    const ck_tile::index_t valid_n1_length = [&]() {
-                        const ck_tile::index_t remaining_n1 = kargs.hdim_v - i_n1;
-                        return ck_tile::min(remaining_n1,
-                                            static_cast<ck_tile::index_t>(FmhaPipeline::kN1));
-                    }();
-                    return FmhaPipeline{}(static_cast<decltype(args)&&>(args)...,
-                                          sink_value,
-                                          valid_k0_loops,
-                                          valid_last_k0_length,
-                                          valid_n1_length);
-                }
-                else
-                {
-                    return FmhaPipeline{}(static_cast<decltype(args)&&>(args)..., sink_value);
-                }
+                
+                return FmhaPipeline{}(static_cast<decltype(args)&&>(args)..., sink_value);
+                
             };
 
-            auto o_acc_tile = [&, i_nhead_ = i_nhead, i_nhead_k_ = i_nhead_k]() {
-                if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PERTENSOR)
-                {
-                    // TODO - move global load of descale to pipeline
-                    float v_descale = *(reinterpret_cast<const float*>(kargs.v_descale_ptr));
-
-                    float scale_p =
-                        ck_tile::type_convert<float>(ck_tile::numeric<PDataType>::max());
-                    float scale_o = v_descale / scale_p;
-
-                    auto o_acc_element_func = [&]() {
-                        if constexpr(std::is_same_v<ODataType, ck_tile::fp8_t>)
-                            return make_composes(
-                                ck_tile::saturates<ck_tile::fp8_t>{},
-                                ck_tile::scales<remove_cvref_t<decltype(scale_o)>>{scale_o});
-                        else
-                            return ck_tile::scales<remove_cvref_t<decltype(scale_o)>>{scale_o};
-                    }();
-                    return invoke_fmha_pipeline(q_dram_window,
-                                                identity{}, // q_element_func
-                                                k_dram_window,
-                                                identity{}, // k_element_func
-                                                v_dram_window,
-                                                identity{}, // v_element_func
-                                                bias_dram_window,
-                                                identity{}, // bias_element_func
-                                                randval_dram_window,
-                                                lse_dram_window,
-                                                identity{}, // lse_element_func
-                                                identity{}, // s_acc_element_func
-                                                scales<remove_cvref_t<decltype(scale_p)>>{
-                                                    scale_p},       // p_compute_element_func
-                                                o_acc_element_func, // o_acc_element_func
-                                                mask,
-                                                position_encoding,
-                                                variant_params.sm_scale,
-                                                variant,
-                                                variant_params,
-                                                block_indices,
-                                                smem_ptr,
-                                                dropout,
-                                                nullptr,
-                                                nullptr,
-                                                1,
-                                                make_null_tile_window(make_tuple()),
-                                                make_null_tile_window(make_tuple()),
-                                                make_null_tile_window(make_tuple()));
-                }
-                else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)
-                {
-                    const float* q_descale_ptr =
-                        reinterpret_cast<const float*>(kargs.q_descale_ptr) +
-                        static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_q_descale +
-                        batch_offset_q_descale;
-                    const float* k_descale_ptr =
-                        reinterpret_cast<const float*>(kargs.k_descale_ptr) +
-                        static_cast<long_index_t>(i_nhead_ / kargs.nhead_ratio_qk) *
-                            kargs.nhead_stride_k_descale +
-                        batch_offset_k_descale;
-                    const float* v_descale_ptr =
-                        reinterpret_cast<const float*>(kargs.v_descale_ptr) +
-                        static_cast<long_index_t>(i_nhead_ / kargs.nhead_ratio_qk) *
-                            kargs.nhead_stride_v_descale +
-                        batch_offset_v_descale;
-
-                    size_t idx      = i_m0 / kargs.block_scale_size_q;
-                    float q_descale = q_descale_ptr[idx];
-                    // BLOCKSCALE: P is scaled in exp2(x+shift) where shift=7 or 8
-                    // Both P and rowsum are scaled by 2^shift, canceling in normalization
-                    // No additional scaling needed in p_compute_element_func or o_acc_element_func
-
-                    return invoke_fmha_pipeline(
-                        q_dram_window,
-                        identity{}, // q_element_func
-                        k_dram_window,
-                        identity{}, // k_element_func
-                        v_dram_window,
-                        identity{}, // v_element_func
-                        bias_dram_window,
-                        identity{}, // bias_element_func
-                        randval_dram_window,
-                        lse_dram_window,
-                        identity{},               // lse_element_func
-                        scales<float>(q_descale), // s_acc_element_func
-                        identity{}, // p_compute_element_func - No scaling (done in exp2)
-                        identity{}, // o_acc_element_func - No dequant needed (canceled by rowsum)
-                        mask,
-                        position_encoding,
-                        kargs.scale_s,
-                        variant,
-                        variant_params,
-                        block_indices,
-                        smem_ptr,
-                        dropout,
-                        k_descale_ptr,
-                        v_descale_ptr,
-                        kargs.block_scale_size_kv,
-                        make_null_tile_window(make_tuple()),
-                        make_null_tile_window(make_tuple()),
-                        make_null_tile_window(make_tuple()));
-                }
-                else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::MX)
-                {
-                    using QScaleDataType = typename FmhaPipeline::QScaleDataType;
-                    using KScaleDataType = typename FmhaPipeline::KScaleDataType;
-                    using VScaleDataType = typename FmhaPipeline::VScaleDataType;
-
-                    constexpr ck_tile::index_t kQKScaleGranularity =
-                        FmhaPipeline::kQKScaleGranularity;
-                    constexpr ck_tile::index_t kVScaleGranularity =
-                        FmhaPipeline::kVScaleGranularity;
-
-                    const QScaleDataType* q_descale_ptr =
-                        reinterpret_cast<const QScaleDataType*>(kargs.q_descale_ptr) +
-                        static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_q_descale +
-                        batch_offset_q_descale;
-                    const KScaleDataType* k_descale_ptr =
-                        reinterpret_cast<const KScaleDataType*>(kargs.k_descale_ptr) +
-                        static_cast<long_index_t>(i_nhead_k_) * kargs.nhead_stride_k_descale +
-                        batch_offset_k_descale;
-                    const VScaleDataType* v_descale_ptr =
-                        reinterpret_cast<const VScaleDataType*>(kargs.v_descale_ptr) +
-                        static_cast<long_index_t>(i_nhead_k_) * kargs.nhead_stride_v_descale +
-                        batch_offset_v_descale;
-
-                    const ck_tile::index_t hdim_q_scale =
-                        ck_tile::integer_divide_ceil(kargs.hdim_q, kQKScaleGranularity);
-                    const ck_tile::index_t seqlen_v_scale =
-                        ck_tile::integer_divide_ceil(kargs.seqlen_k, kVScaleGranularity);
-
-                    // Custom invalid_element_value is required for e8m0_t scales because
-                    // the default (numeric<e8m0_t>>::zero()) is NaN
-                    const auto q_scale_dram = [&]() {
-                        auto desc =
-                            make_naive_tensor_descriptor(make_tuple(kargs.seqlen_q, hdim_q_scale),
-                                                         make_tuple(kargs.stride_q_descale, 1),
-                                                         number<1>{},
-                                                         number<1>{});
-                        auto buffer_view = make_buffer_view<address_space_enum::global>(
-                            q_descale_ptr,
-                            desc.get_element_space_size(),
-                            type_convert<QScaleDataType>(1.0f));
-                        return pad_tensor_view(
-                            tensor_view<decltype(buffer_view), decltype(desc)>{buffer_view, desc},
-                            make_tuple(
-                                number<FmhaPipeline::kM0>{},
-                                number<(FmhaPipeline::kQLoadOnce ? FmhaPipeline::kSubQKHeaddim
-                                                                 : FmhaPipeline::kK0) /
-                                       kQKScaleGranularity>{}),
-                            sequence<kPadSeqLenQ, kPadHeadDimQ>{});
-                    }();
-                    const auto k_scale_dram = [&]() {
-                        auto desc =
-                            make_naive_tensor_descriptor(make_tuple(kargs.seqlen_k, hdim_q_scale),
-                                                         make_tuple(kargs.stride_k_descale, 1),
-                                                         number<1>{},
-                                                         number<1>{});
-                        auto buffer_view = make_buffer_view<address_space_enum::global>(
-                            k_descale_ptr,
-                            desc.get_element_space_size(),
-                            type_convert<KScaleDataType>(1.0f));
-                        return pad_tensor_view(
-                            tensor_view<decltype(buffer_view), decltype(desc)>{buffer_view, desc},
-                            make_tuple(number<FmhaPipeline::kN0>{},
-                                       number<FmhaPipeline::kK0 / kQKScaleGranularity>{}),
-                            sequence<false, kPadHeadDimQ>{});
-                    }();
-                    const auto v_scale_dram = [&]() {
-                        static_assert(
-                            std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::ColumnMajor>);
-                        auto desc =
-                            make_naive_tensor_descriptor(make_tuple(kargs.hdim_v, seqlen_v_scale),
-                                                         make_tuple(kargs.stride_v_descale, 1),
-                                                         number<1>{},
-                                                         number<1>{});
-                        auto buffer_view = make_buffer_view<address_space_enum::global>(
-                            v_descale_ptr,
-                            desc.get_element_space_size(),
-                            type_convert<VScaleDataType>(1.0f));
-                        return pad_tensor_view(
-                            tensor_view<decltype(buffer_view), decltype(desc)>{buffer_view, desc},
-                            make_tuple(number<FmhaPipeline::kN1>{},
-                                       number<FmhaPipeline::kK1 / kVScaleGranularity>{}),
-                            sequence<false, kPadSeqLenK>{});
-                    }();
-
-                    auto q_scale_dram_window = make_tile_window(
-                        q_scale_dram,
-                        make_tuple(number<FmhaPipeline::kM0>{},
-                                   number<(FmhaPipeline::kQLoadOnce ? FmhaPipeline::kSubQKHeaddim
-                                                                    : FmhaPipeline::kK0) /
-                                          kQKScaleGranularity>{}),
-                        {i_m0, 0});
-                    auto k_scale_dram_window = make_tile_window(
-                        k_scale_dram,
-                        make_tuple(number<FmhaPipeline::kN0>{},
-                                   number<FmhaPipeline::kK0 / kQKScaleGranularity>{}),
-                        {0, 0});
-                    auto v_scale_dram_window = make_tile_window(
-                        v_scale_dram,
-                        make_tuple(number<FmhaPipeline::kN1>{},
-                                   number<FmhaPipeline::kK1 / kVScaleGranularity>{}),
-                        {i_n1, 0});
-
-                    return invoke_fmha_pipeline(q_dram_window,
-                                                identity{}, // q_element_func
-                                                k_dram_window,
-                                                identity{}, // k_element_func
-                                                v_dram_window,
-                                                identity{}, // v_element_func
-                                                bias_dram_window,
-                                                identity{}, // bias_element_func
-                                                randval_dram_window,
-                                                lse_dram_window,
-                                                identity{}, // lse_element_func
-                                                identity{}, // s_acc_element_func
-                                                identity{}, // p_compute_element_func
-                                                identity{}, // o_acc_element_func
-                                                mask,
-                                                position_encoding,
-                                                kargs.scale_s,
-                                                variant,
-                                                variant_params,
-                                                block_indices,
-                                                smem_ptr,
-                                                dropout,
-                                                nullptr,
-                                                nullptr,
-                                                1,
-                                                q_scale_dram_window,
-                                                k_scale_dram_window,
-                                                v_scale_dram_window);
-                }
-                else
-                {
-                    return invoke_fmha_pipeline(q_dram_window,
-                                                k_dram_window,
-                                                v_dram_window,
-                                                bias_dram_window,
-                                                randval_dram_window,
-                                                lse_dram_window,
-                                                mask,
-                                                position_encoding,
-                                                variant_params.sm_scale,
-                                                variant,
-                                                variant_params,
-                                                block_indices,
-                                                smem_ptr,
-                                                dropout);
-                }
-            }();
+            // HERMES_SIMPLIFIED_CURRENT_BRANCH: current kernel is nqscale;
+            // keep only the non PERTENSOR/BLOCKSCALE/MX invocation path.
+            auto o_acc_tile = invoke_fmha_pipeline(q_dram_window,
+                                                   k_dram_window,
+                                                   v_dram_window,
+                                                   bias_dram_window,
+                                                   randval_dram_window,
+                                                   lse_dram_window,
+                                                   mask,
+                                                   position_encoding,
+                                                   variant_params.sm_scale,
+                                                   variant,
+                                                   variant_params,
+                                                   block_indices,
+                                                   smem_ptr,
+                                                   dropout);
 
             // O DRAM and O DRAM window
             auto o_dram = [&]() {
@@ -2337,6 +1715,7 @@ struct FmhaFwdKernel
 
             EpiloguePipeline{}(o_dram_window, o_acc_tile, nullptr);
         }
+#if 0 // HERMES_SIMPLIFIED_CURRENT_BRANCH: disabled qr_async_trload / qr_tdm branch
         else
         {
             // TODO: Refine the logical here.
@@ -3131,6 +2510,7 @@ struct FmhaFwdKernel
 
             EpiloguePipeline{}(o_dram_window, o_acc_tile, nullptr);
         }
+#endif // HERMES_SIMPLIFIED_CURRENT_BRANCH
     }
 };
 

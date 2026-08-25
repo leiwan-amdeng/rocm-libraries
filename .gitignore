@@ -19,3 +19,46 @@ CMakeUserPresets.json
 /parametric-chaos-v2.pdf
 /params-=findings.md
 /check_caps.py
+
+# Local CK/FMHA build artifacts
+projects/composablekernel/build*/
+projects/composablekernel/**/build*/
+projects/composablekernel/CMakeFiles/
+projects/composablekernel/CMakeCache.txt
+projects/composablekernel/compile_commands.json
+
+# rocprof / ATT / viewer generated outputs
+projects/composablekernel/rocprof*/
+projects/composablekernel/*_fullsrc*/
+projects/composablekernel/**/ui_output_agent_*_dispatch_*/
+projects/composablekernel/**/stats_ui_output_agent_*_dispatch_*.csv
+projects/composablekernel/**/*.att
+projects/composablekernel/**/*_gfx*_code_object_id_*.out
+
+# local generated profiling/viewer helpers
+projects/composablekernel/**/code.json
+projects/composablekernel/**/snapshots.json
+projects/composablekernel/**/source_*
+
+# local backup files
+projects/composablekernel/**/*.bak
+projects/composablekernel/**/*.bak_*
+projects/composablekernel/**/*_backup_*
+projects/composablekernel/**/*_short_codejson_backup_*
+
+# Python cache
+projects/composablekernel/**/__pycache__/
+projects/composablekernel/**/*.pyc
+
+# FMHA local tuning scripts and result CSV/logs
+projects/composablekernel/rescale_threshold*.csv
+projects/composablekernel/fmha_tune*.csv
+projects/composablekernel/fmha_tune*_logs*/
+projects/composablekernel/sweep_d128*.py
+projects/composablekernel/tmp_*.py
+projects/composablekernel/tune_fmha_d128_gfx1201.py
+projects/composablekernel/tune_grid_reorder_focus.py
+projects/composablekernel/rocprof_flame.sh
+projects/composablekernel/1.txt
+projects/composablekernel/first8.csv
+projects/composablekernel/bench_logs_fmha_hint_modes_*/

@@ -840,6 +840,12 @@ struct BlockFmhaPipelineQXKSVSCustomPolicy : BlockFmhaPipelineQXCustomPolicy<QLo
             constexpr index_t MaxVectorSize =
                 16 * numeric_traits<KDataType>::PackedSize / sizeof(KDataType);
             constexpr index_t ElemPerThread = (kNPerBlock * kKPerBlock) / kBlockSize;
+            
+            // N0 = 2;
+            // N1 = 8;
+            // N2 = 4;
+            // K0 = 8;
+            // K1 = 8;
 
             constexpr index_t K1 = min(MaxVectorSize, ElemPerThread);
             constexpr index_t K0 = kKPerBlock / K1;
@@ -854,6 +860,14 @@ struct BlockFmhaPipelineQXKSVSCustomPolicy : BlockFmhaPipelineQXCustomPolicy<QLo
                                            tuple<sequence<1>, sequence<2, 0>>,
                                            sequence<1, 2>,
                                            sequence<0, 1>>{});
+
+
+                // tile_distribution_encoding<sequence<1>,
+                //                            tuple<sequence<N0, N2, N1>, sequence<K0, K1>>,
+                //                            tuple<sequence<1>, sequence<1, 2>>,
+                //                            tuple<sequence<2>, sequence<1, 0>>,
+                //                            sequence<1, 2>,
+                //                            sequence<0, 1>>{});
         }
         else
         {
@@ -929,13 +943,26 @@ struct BlockFmhaPipelineQXKSVSCustomPolicy : BlockFmhaPipelineQXCustomPolicy<QLo
                 constexpr index_t K1 = get_warp_size() / (K2 * N0);
                 constexpr index_t K0 = kBlockSize / get_warp_size();
                 static_assert(kKPerBlock == K0 * K1 * K2 * K3);
+                // N0 = 16
+                // N1 = 8
+                // K0 = 8
+                // K1 = 1
+                // K2 = 2
+                // K3 = 4
+
                 return make_static_tile_distribution(
                     tile_distribution_encoding<sequence<1>,
-                                               tuple<sequence<N0, N1>, sequence<K0, K1, K2, K3>>,
+                                               tuple<sequence<N0, N1>, sequence<K0, K1, K2, K3>>, // 128 64 
                                                tuple<sequence<2>, sequence<2, 1, 2>>,
                                                tuple<sequence<0>, sequence<1, 0, 2>>,
                                                sequence<2, 1>,
                                                sequence<3, 1>>{});
+                    // tile_distribution_encoding<sequence<1>,
+                    //                            tuple<sequence<4, 4, 8>, sequence<4, 2,8>>,
+                    //                            tuple<sequence<2,2>, sequence< 1, 1>>,
+                    //                            tuple<sequence<0,1>, sequence< 1, 2>>,
+                    //                            sequence<1, 2>,
+                    //                            sequence<0, 2>>{});
             }
             else
             {

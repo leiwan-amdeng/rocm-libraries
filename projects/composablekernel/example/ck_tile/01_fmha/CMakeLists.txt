@@ -43,12 +43,21 @@ set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS "${CODE_GEN_SCRIPTS}
 list(JOIN INST_TARGETS , FMHA_TARGETS_ARG)
 
 string(REPLACE ";" "," FMHA_FWD_APIS "${FMHA_FWD_ENABLE_APIS}")
+
+set(FMHA_FWD_OPT_DIMS "32,64,80,128,256" CACHE STRING
+  "comma-separated CK Tile FMHA forward head dimensions to generate, e.g. 128")
+set(FMHA_FWD_CODE_GEN_FILTER "" CACHE STRING
+  "optional fnmatch filter passed to example/ck_tile/01_fmha/generate.py --filter")
+
 set(FMHA_FWD_CODE_GEN_COMMON_ARGS
   ${CMAKE_CURRENT_LIST_DIR}/generate.py
   --targets ${FMHA_TARGETS_ARG}
   --api ${FMHA_FWD_APIS}
-  --optdim 32,64,80,128,256
+  --optdim ${FMHA_FWD_OPT_DIMS}
 )
+if(FMHA_FWD_CODE_GEN_FILTER)
+  list(APPEND FMHA_FWD_CODE_GEN_COMMON_ARGS --filter ${FMHA_FWD_CODE_GEN_FILTER})
+endif()
 set(FMHA_BWD_CODE_GEN_COMMON_ARGS
   ${CMAKE_CURRENT_LIST_DIR}/generate.py
   --targets ${FMHA_TARGETS_ARG}

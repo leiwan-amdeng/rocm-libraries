@@ -36,7 +36,7 @@ struct BlockFmhaV3PipelineDefaultPolicy
     {
         using namespace ck_tile;
         using KDataType = remove_cvref_t<typename Problem::KDataType>;
-#if defined(__gfx950__)
+#if defined(__gfx950__) || defined(__gfx12__)
         constexpr index_t MaxReadSizeInBytes = 16;
 #else
         constexpr index_t MaxReadSizeInBytes = 4;
@@ -49,7 +49,7 @@ struct BlockFmhaV3PipelineDefaultPolicy
     {
         using namespace ck_tile;
         using VDataType = remove_cvref_t<typename Problem::VDataType>;
-#if defined(__gfx950__)
+#if defined(__gfx950__) || defined(__gfx12__)
         constexpr index_t MaxReadSizeInBytes = 16;
 #else
         constexpr index_t MaxReadSizeInBytes = 4;

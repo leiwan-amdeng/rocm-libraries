@@ -66,6 +66,7 @@ struct BlockFmhaPipelineQRKSVSWholeKPrefetch
     static constexpr bool kStoreLSE         = Problem::kStoreLSE;
     static constexpr bool kHasDropout       = Problem::kHasDropout;
     static constexpr bool kHasLogitsSoftCap = Problem::kHasLogitsSoftCap;
+    static constexpr bool kHasSink          = Problem::kHasSink;
 
     // since this pipeline is only used by the inference path of xformers, the Dropout function is
     // not well tested with the pipeline, so here we have Dropout disabled

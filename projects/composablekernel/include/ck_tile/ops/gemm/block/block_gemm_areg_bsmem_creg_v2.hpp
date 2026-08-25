@@ -139,10 +139,7 @@ struct BlockGemmARegBSmemCRegV2
         constexpr auto a_warp_y_index_zeros = uniform_sequence_gen_t<AWarpDstr::NDimY, 0>{};
         constexpr auto c_warp_y_index_zeros = uniform_sequence_gen_t<CWarpDstr::NDimY, 0>{};
 
-        auto run_n_iter = [&](auto kIter, auto nIter) {
-            // read B warp tensor from B Block window
-            const auto b_warp_tensor = load_tile(b_warp_windows(nIter)(kIter));
-
+        auto run_n_iter_with_b = [&](auto kIter, auto nIter, const auto& b_warp_tensor) {
             static_for<0, MIterPerWarp, 1>{}([&](auto mIter) {
                 // read A warp tensor from A block tensor
                 AWarpTensor a_warp_tensor;
@@ -160,7 +157,6 @@ struct BlockGemmARegBSmemCRegV2
 
                 // warp GEMM
                 WG{}(c_warp_tensor, a_warp_tensor, b_warp_tensor);
-                // WG{}(c_warp_tensor, a_warp_tensor, b_warp_tensor_array[nIter]);
 
                 // write C warp tensor into C block tensor
                 c_block_tensor.set_y_sliced_thread_data(
@@ -168,6 +164,12 @@ struct BlockGemmARegBSmemCRegV2
                     merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
                     c_warp_tensor.get_thread_buffer());
             });
+        };
+
+        auto run_n_iter = [&](auto kIter, auto nIter) {
+            // read B warp tensor from B Block window
+            const auto b_warp_tensor = load_tile(b_warp_windows(nIter)(kIter));
+            run_n_iter_with_b(kIter, nIter, b_warp_tensor);
         };
 
         // hot loop:
@@ -184,9 +186,105 @@ struct BlockGemmARegBSmemCRegV2
         }
         else
         {
-            static_for<0, KIterPerWarp, 1>{}([&](auto kIter) {
-                static_for<0, NIterPerWarp, 1>{}([&](auto nIter) { run_n_iter(kIter, nIter); });
-            });
+            // DenseOnly/PV experiment: for GEMM1 shape M=128,N=128,K=64, keep one LDS B
+            // fragment prefetched while computing the current fragment.  This targets the
+            // observed ds_load_b128 -> s_wait_dscnt -> v_wmma pattern in the PV hotspot.
+            // Other block-GEMM shapes use the original order.
+            // 4-stage B-fragment lookahead over NIterPerWarp.
+            {
+                static_for<0, KIterPerWarp, 1>{}([&](auto kIter) {
+                    constexpr auto n0 = number<0>{};
+                    auto b_cur        = load_tile(b_warp_windows(n0)(kIter));
+                    if constexpr(NIterPerWarp > 1)
+                    {
+                        constexpr auto n1 = number<1>{};
+                        auto b_next1      = load_tile(b_warp_windows(n1)(kIter));
+                        if constexpr(NIterPerWarp > 2)
+                        {
+                            constexpr auto n2 = number<2>{};
+                            auto b_next2      = load_tile(b_warp_windows(n2)(kIter));
+                            if constexpr(NIterPerWarp > 3)
+                            {
+                                constexpr auto n3 = number<3>{};
+                                auto b_next3      = load_tile(b_warp_windows(n3)(kIter));
+                                static_for<0, NIterPerWarp, 1>{}([&](auto nIter) {
+                                    if constexpr(nIter.value + 4 < NIterPerWarp)
+                                    {
+                                        constexpr auto nLoad = number<nIter.value + 4>{};
+                                        auto b_new = load_tile(b_warp_windows(nLoad)(kIter));
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                        b_cur   = b_next1;
+                                        b_next1 = b_next2;
+                                        b_next2 = b_next3;
+                                        b_next3 = b_new;
+                                    }
+                                    else if constexpr(nIter.value + 3 < NIterPerWarp)
+                                    {
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                        b_cur   = b_next1;
+                                        b_next1 = b_next2;
+                                        b_next2 = b_next3;
+                                    }
+                                    else if constexpr(nIter.value + 2 < NIterPerWarp)
+                                    {
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                        b_cur   = b_next1;
+                                        b_next1 = b_next2;
+                                    }
+                                    else if constexpr(nIter.value + 1 < NIterPerWarp)
+                                    {
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                        b_cur = b_next1;
+                                    }
+                                    else
+                                    {
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                    }
+                                });
+                            }
+                            else
+                            {
+                                static_for<0, NIterPerWarp, 1>{}([&](auto nIter) {
+                                    if constexpr(nIter.value + 2 < NIterPerWarp)
+                                    {
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                        b_cur   = b_next1;
+                                        b_next1 = b_next2;
+                                    }
+                                    else if constexpr(nIter.value + 1 < NIterPerWarp)
+                                    {
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                        b_cur = b_next1;
+                                    }
+                                    else
+                                    {
+                                        run_n_iter_with_b(kIter, nIter, b_cur);
+                                    }
+                                });
+                            }
+                        }
+                        else
+                        {
+                            static_for<0, NIterPerWarp, 1>{}([&](auto nIter) {
+                                if constexpr(nIter.value + 1 < NIterPerWarp)
+                                {
+                                    run_n_iter_with_b(kIter, nIter, b_cur);
+                                    b_cur = b_next1;
+                                }
+                                else
+                                {
+                                    run_n_iter_with_b(kIter, nIter, b_cur);
+                                }
+                            });
+                        }
+                    }
+                    else
+                    {
+                        constexpr auto nIter = number<0>{};
+                        run_n_iter_with_b(kIter, nIter, b_cur);
+                    }
+                });
+            }
         }
     }
 
