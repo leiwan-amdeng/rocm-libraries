@@ -871,7 +871,7 @@ class KernelComponentFactoryGfx1201(KernelComponentFactoryGfx9, CompatibilityRul
                 # Reuse it first for i8/fp8 product bring-up; larger 32x32 quant tiles need a
                 # separate correctness pass on wave32/gfx1201.
                 (128, 128): [
-                    SageAttnFwdTileSize(128, 64, 32, 128, 32, 128, 4, 1, 1, 4, 1, 1, 16, 16, 16, 16, 16, 16, -1),  # fmt: skip
+                    SageAttnFwdTileSize(128, 32, 32, 128, 32, 128, 4, 1, 1, 4, 1, 1, 16, 16, 16, 16, 16, 16, -1),  # fmt: skip
                 ],
             }
         raise ValueError(f"unsupported dtype={dtype}")
