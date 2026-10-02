@@ -639,12 +639,46 @@ struct BlockSageAttentionPipelineQRKSVS
                 }
             };
 
+#ifndef CK_TILE_SAGE_ATTN_RESCALE_THRESHOLD
+#define CK_TILE_SAGE_ATTN_RESCALE_THRESHOLD 0.0f
+#endif
+            // Lazy/conditional online-softmax rescale.  Threshold 0.0 means exact-only:
+            // skip the Oacc multiply only when the running max is unchanged.  Positive
+            // thresholds also skip small corrections by keeping P in the previous max
+            // frame; this is experimental for FP8 P and must be correctness-checked.
+            static constexpr SMPLComputeDataType kRescaleThreshold =
+                type_convert<SMPLComputeDataType>(CK_TILE_SAGE_ATTN_RESCALE_THRESHOLD);
+            auto m_stab = make_static_distributed_tensor<SMPLComputeDataType>(m.get_tile_distribution());
+            auto rescale_factor = make_static_distributed_tensor<SMPLComputeDataType>(m.get_tile_distribution());
+            auto needs_rescale = make_static_distributed_tensor<bool>(m.get_tile_distribution());
+            set_tile(needs_rescale, false);
+
+            constexpr auto m_spans = decltype(m)::get_distributed_spans();
+            sweep_tile_span(m_spans[number<0>{}], [&](auto idx0) {
+                constexpr auto i_idx = make_tuple(idx0);
+                const auto m_new = get_validated_m(m[i_idx]);
+                const auto acc_scale_log2 = scale_s * m_old[i_idx] - scale_s * m_new;
+                const bool need_rescale =
+                    (acc_scale_log2 < type_convert<SMPLComputeDataType>(-kRescaleThreshold));
+                if(need_rescale)
+                {
+                    rescale_factor(i_idx) = exp2(acc_scale_log2);
+                    m_stab(i_idx) = m[i_idx];
+                    needs_rescale(i_idx) = true;
+                }
+                else
+                {
+                    m_stab(i_idx) = m_old[i_idx];
+                    m(i_idx) = m_old[i_idx];
+                }
+            });
+
             constexpr auto p_spans = decltype(p_compute)::get_distributed_spans();
             sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
                 constexpr auto i_idx = make_tuple(idx0);
                 // For BLOCKSCALE: precompute (m - shift) once per row
                 // exp2(s - m + shift) = exp2(s - (m - shift)); pertensor path uses scale_s on s,m
-                auto validated_m = get_validated_m(m[i_idx]);
+                auto validated_m = get_validated_m(m_stab[i_idx]);
                 auto row_max     = scale_s * validated_m;
                 if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE ||
                              QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP ||
@@ -673,15 +707,19 @@ struct BlockSageAttentionPipelineQRKSVS
             sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
                 constexpr auto i_idx = make_tuple(idx0);
 
-                const auto m_new = get_validated_m(m[i_idx]);
-                auto row_max     = scale_s * m_new;
-                const auto tmp   = exp2(scale_s * m_old[i_idx] - row_max);
-                // Update l and rescale o_acc
-                l(i_idx) = tmp * l(i_idx) + rowsum_p[i_idx];
-                sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
-                    constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                    o_acc(i_j_idx) *= tmp;
-                });
+                if(needs_rescale[i_idx])
+                {
+                    const auto tmp = rescale_factor[i_idx];
+                    l(i_idx) = tmp * l(i_idx) + rowsum_p[i_idx];
+                    sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
+                        constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                        o_acc(i_j_idx) *= tmp;
+                    });
+                }
+                else
+                {
+                    l(i_idx) = l(i_idx) + rowsum_p[i_idx];
+                }
             });
 
             block_sync_lds();
