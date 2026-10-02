@@ -846,6 +846,55 @@ class KernelComponentFactoryGfx950(
         return super().get_hdim_tile_size_dict(dtype)
 
 
+class KernelComponentFactoryGfx1201(KernelComponentFactoryGfx9, CompatibilityRuleFactoryGfx9):
+    # Functional bring-up only: one gfx1201 bf16 d128 batch/no-mask/no-qscale kernel.
+    # Use ck_tile::gfx120_t as the launch tag; gfx1201 is covered by __gfx120__ in ck_tile config.
+    arch = ArchTrait(
+        "gfx1201",
+        preprocessor_check="defined(__gfx1201__)",
+        device_name_check='device_name.compare(0, 7, "gfx1201") == 0',
+        tag="ck_tile::gfx120_t",
+        filename_suffix="_gfx1201",
+    )
+
+    @classmethod
+    def supported_dtypes(cls) -> Tuple[str]:
+        # Keep the bf16 validation kernel and add the real SageAttention product dtype:
+        # Q/K int8 + V/P fp8 + O bf16.
+        return cls._DT_BF16 + cls._DT_I8FP8BF16
+
+    @classmethod
+    def get_hdim_tile_size_dict(cls, dtype: str) -> Optional[dict]:
+        if dtype in cls._DT_BF16 or dtype in cls._DT_I8FP8BF16:
+            return {
+                # gfx1201 tuned functional path: b128x64 + w16x16x16 validates on bf16 d128 NHD.
+                # Reuse it first for i8/fp8 product bring-up; larger 32x32 quant tiles need a
+                # separate correctness pass on wave32/gfx1201.
+                (128, 128): [
+                    SageAttnFwdTileSize(128, 64, 32, 128, 32, 128, 4, 1, 1, 4, 1, 1, 16, 16, 16, 16, 16, 16, -1),  # fmt: skip
+                ],
+            }
+        raise ValueError(f"unsupported dtype={dtype}")
+
+    @classmethod
+    def get_pipelines(
+        cls, dtype, hdim, hdim_v, receipt, mask_impl
+    ) -> List[SageAttnFwdPipeline]:
+        if hdim == 128 and hdim_v == 128:
+            # Conservative sync QR path avoids the gfx1201 raw_buffer_load_lds async blocker.
+            if dtype in cls._DT_BF16:
+                return [
+                    SageAttnFwdPipeline("qr", "row", "t", "t", "f", "f", "no", "no", "f"),  # fmt: skip
+                ]
+            if dtype in cls._DT_I8FP8BF16:
+                # Target product path: qk_int8_per_block + pv_fp8.
+                # BLOCKSCALE means per-block q/k descale; v_descale is per output channel.
+                return [
+                    SageAttnFwdPipeline("qr", "row", "t", "t", "f", "f", "blockscale", "no", "f"),  # fmt: skip
+                ]
+        return []
+
+
 class CustomFactory(KernelComponentFactoryGfx9, CompatibilityRuleFactoryGfx9):
     @classmethod
     def get_hdim_tile_size_dict(cls, dtype: str) -> Optional[dict]:
@@ -862,6 +911,8 @@ def get_factory(target: str):
 
     # Place more specific architectures first
 
+    if target.startswith("gfx1201"):
+        return KernelComponentFactoryGfx1201
     if target.startswith("gfx950"):
         return KernelComponentFactoryGfx950
     if target.startswith("gfx9"):

@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: MIT
 
 set(INST_TARGETS ${SUPPORTED_GPU_TARGETS})
-# Currently only gfx9 arch is supported
-list(FILTER INST_TARGETS INCLUDE REGEX "gfx9")
+# Currently support gfx9 plus gfx1201 functional bring-up
+list(FILTER INST_TARGETS INCLUDE REGEX "gfx9|gfx1201")
 if(NOT INST_TARGETS)
-  message(WARNING "Skipping SageAttention compilation: No supported GPU targets (gfx9) found in SUPPORTED_GPU_TARGETS: ${SUPPORTED_GPU_TARGETS}")
+  message(WARNING "Skipping SageAttention compilation: No supported GPU targets (gfx9/gfx1201) found in SUPPORTED_GPU_TARGETS: ${SUPPORTED_GPU_TARGETS}")
   return()
 endif()
 
@@ -27,6 +27,8 @@ set(SAGEATTN_FWD_CODE_GEN_COMMON_ARGS
   --targets ${SAGEATTN_TARGETS_ARG}
   --api fwd
   --optdim 128
+  --mask generic
+  --filter "sageattn_fwd_d128_*_batch_*_qr_vr_pssk_nmask_nskip_*"
 )
 
 # Generate list of kernels to build
