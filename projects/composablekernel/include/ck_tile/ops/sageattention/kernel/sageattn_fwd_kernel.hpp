@@ -58,11 +58,11 @@ struct SageAttnFwdKernel
     static constexpr bool kUseAsyncCopy = SageAttnPipeline::Policy::AsyncCopy;
 
 #ifndef CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK
-#define CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK 0
+#define CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK 1
 #endif
 
 #ifndef CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M
-#define CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M 0
+#define CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M 512
 #endif
 
 
