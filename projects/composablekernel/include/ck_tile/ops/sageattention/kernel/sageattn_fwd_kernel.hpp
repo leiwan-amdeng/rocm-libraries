@@ -62,7 +62,7 @@ struct SageAttnFwdKernel
 #endif
 
 #ifndef CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M
-#define CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M 512
+#define CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M 448
 #endif
 
 
