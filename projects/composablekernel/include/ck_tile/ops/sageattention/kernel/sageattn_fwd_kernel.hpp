@@ -57,6 +57,15 @@ struct SageAttnFwdKernel
 
     static constexpr bool kUseAsyncCopy = SageAttnPipeline::Policy::AsyncCopy;
 
+#ifndef CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK
+#define CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK 0
+#endif
+
+#ifndef CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M
+#define CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M 0
+#endif
+
+
     // Distinct empty bases (I = 0 mask slot, 1 qscale slot, 2 min_seqlen_q slot) avoid duplicate
     // base-class issues under multiple inheritance.
     template <ck_tile::index_t I>
@@ -457,10 +466,32 @@ struct SageAttnFwdKernel
             // Sequence-major launch order for dense/no-padding mode:
             // make query/output tile the fastest-moving grid dimension to improve
             // K/V L2 reuse across neighbouring CTAs of the same head.
-            return dim3(ck_tile::integer_divide_ceil(seqlen_q_, SageAttnPipeline::kM0) *
-                            ck_tile::integer_divide_ceil(hdim_v_, SageAttnPipeline::kN1),
-                        nhead_,
-                        batch_size_);
+            constexpr index_t kSwizzleM = CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M;
+            if constexpr(CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK &&
+                         !kHasMask &&
+                         !kIsGroupMode &&
+                         SageAttnPipeline::kN1 == 128)
+            {
+                const index_t num_tile_m =
+                    ck_tile::integer_divide_ceil(seqlen_q_, SageAttnPipeline::kM0);
+                if constexpr(kSwizzleM > 0)
+                {
+                    return dim3(kSwizzleM,
+                                ck_tile::integer_divide_ceil(num_tile_m, kSwizzleM) * nhead_,
+                                batch_size_);
+                }
+                else
+                {
+                    return dim3(num_tile_m, nhead_, batch_size_);
+                }
+            }
+            else
+            {
+                return dim3(ck_tile::integer_divide_ceil(seqlen_q_, SageAttnPipeline::kM0) *
+                                ck_tile::integer_divide_ceil(hdim_v_, SageAttnPipeline::kN1),
+                            nhead_,
+                            batch_size_);
+            }
         }
     }
 
@@ -501,30 +532,53 @@ struct SageAttnFwdKernel
         }
         else
         {
-            // const index_t num_tile_m0 = seqlen_q / kM0;
-            const index_t num_tile_n1 =
-                ck_tile::integer_divide_ceil(kargs.hdim_v, SageAttnPipeline::kN1);
-
-            const index_t i_block = blockIdx.x;
-            const index_t i_nhead = blockIdx.y;
-            const index_t i_batch = blockIdx.z;
-
-            const auto f = [](index_t dividend, index_t divisor) {
-                index_t quotient = dividend / divisor;
-                index_t modulus  = dividend - quotient * divisor;
-                return ck_tile::make_tuple(quotient, modulus);
-            };
-
-            const auto [i_tile_m, i_tile_n] = f(i_block, num_tile_n1);
-
-            if constexpr(kHasMask)
+            constexpr index_t kSwizzleM = CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M;
+            if constexpr(CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK &&
+                         !kHasMask &&
+                         !kIsGroupMode &&
+                         SageAttnPipeline::kN1 == 128)
             {
-                // assume that num_tile_n1 is always 1
-                return ck_tile::make_tuple(gridDim.x - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
+                const index_t i_batch = blockIdx.z;
+                if constexpr(kSwizzleM > 0)
+                {
+                    const index_t group_head = blockIdx.y;
+                    const index_t i_nhead = group_head % kargs.num_head_q;
+                    const index_t group_m = group_head / kargs.num_head_q;
+                    const index_t i_tile_m = group_m * kSwizzleM + blockIdx.x;
+                    return ck_tile::make_tuple(i_tile_m, index_t{0}, i_nhead, i_batch);
+                }
+                else
+                {
+                    return ck_tile::make_tuple(static_cast<index_t>(blockIdx.x), index_t{0}, static_cast<index_t>(blockIdx.y), i_batch);
+                }
             }
             else
             {
-                return ck_tile::make_tuple(i_tile_m, i_tile_n, i_nhead, i_batch);
+                // const index_t num_tile_m0 = seqlen_q / kM0;
+                const index_t num_tile_n1 =
+                    ck_tile::integer_divide_ceil(kargs.hdim_v, SageAttnPipeline::kN1);
+
+                const index_t i_block = blockIdx.x;
+                const index_t i_nhead = blockIdx.y;
+                const index_t i_batch = blockIdx.z;
+
+                const auto f = [](index_t dividend, index_t divisor) {
+                    index_t quotient = dividend / divisor;
+                    index_t modulus  = dividend - quotient * divisor;
+                    return ck_tile::make_tuple(quotient, modulus);
+                };
+
+                const auto [i_tile_m, i_tile_n] = f(i_block, num_tile_n1);
+
+                if constexpr(kHasMask)
+                {
+                    // assume that num_tile_n1 is always 1
+                    return ck_tile::make_tuple(gridDim.x - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
+                }
+                else
+                {
+                    return ck_tile::make_tuple(i_tile_m, i_tile_n, i_nhead, i_batch);
+                }
             }
         }
     }
@@ -554,6 +608,18 @@ struct SageAttnFwdKernel
         const auto [i_tile_m, i_tile_n, i_nhead, i_batch] = GetTileIndex(kargs);
         const index_t i_m0 = amd_wave_read_first_lane(i_tile_m * SageAttnPipeline::kM0);
         const index_t i_n1 = amd_wave_read_first_lane(i_tile_n * SageAttnPipeline::kN1);
+
+        if constexpr(CK_TILE_SAGE_ATTN_FIXED_D128_NOMASK &&
+                     CK_TILE_SAGE_ATTN_GRID_SWIZZLE_M > 0 &&
+                     !kHasMask &&
+                     !kIsGroupMode &&
+                     SageAttnPipeline::kN1 == 128)
+        {
+            if(i_m0 >= kargs.seqlen_q)
+            {
+                return;
+            }
+        }
 
         long_index_t batch_offset_q         = 0;
         long_index_t batch_offset_k         = 0;
