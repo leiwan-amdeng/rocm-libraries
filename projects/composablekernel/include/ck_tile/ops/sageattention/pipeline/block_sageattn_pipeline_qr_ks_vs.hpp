@@ -327,7 +327,7 @@ struct BlockSageAttentionPipelineQRKSVS
             }
         };
 
-        static_assert(2 <= k0_loops);
+        static_assert(1 <= k0_loops);
         static_assert(1 <= k1_loops);
         constexpr index_t kGemm0MPerWarp = BlockSageAttnShape::Gemm0WarpTile::at(number<0>{});
         static_assert(get_warp_size() % kGemm0MPerWarp == 0);
@@ -416,33 +416,51 @@ struct BlockSageAttentionPipelineQRKSVS
                 }
             };
             auto k_block_tile = load_tile(k_dram_window);
+            clear_tile(s_acc_gemm); // initialize C
+
+            if constexpr(k0_loops == 1)
+            {
+                // Single-K QK path for hdim=128,kK0=128.  The generic pipeline assumes at
+                // least two K slices so it can prefetch K1 while K0 lives in LDS; with a full-D
+                // K tile there is no second slice and the overwrite/readback syncs disappear.
+                store_k_block_tile_to_lds(k_block_tile);
+            }
+            else
             {
                 move_tile_window(k_dram_window, {0, kK0});
-                clear_tile(s_acc_gemm); // initialize C
                 store_k_block_tile_to_lds(k_block_tile);
                 k_block_tile = load_tile(k_dram_window);
-            }
 
-            if constexpr(k0_loops > 2)
-            {
-                static_for<0, k0_loops - 2, 1>{}([&](auto i_k0) {
-                    block_sync_lds();
-                    gemm_0(s_acc_gemm,
-                           get_slice_tile(q_tile,
-                                          sequence<0, i_k0 * kK0>{},
-                                          sequence<kM0, (i_k0 + 1) * kK0>{}),
-                           k_lds_window);
-                    schedule_gemm0();
-                    block_sync_lds();
-                    move_tile_window(k_dram_window, {0, kK0});
+                if constexpr(k0_loops > 2)
+                {
+                    static_for<0, k0_loops - 2, 1>{}([&](auto i_k0) {
+                        block_sync_lds();
+                        gemm_0(s_acc_gemm,
+                               get_slice_tile(q_tile,
+                                              sequence<0, i_k0 * kK0>{},
+                                              sequence<kM0, (i_k0 + 1) * kK0>{}),
+                               k_lds_window);
+                        schedule_gemm0();
+                        block_sync_lds();
+                        move_tile_window(k_dram_window, {0, kK0});
 
-                    store_k_block_tile_to_lds(k_block_tile); // LDS write i + 1
-                    k_block_tile = load_tile(k_dram_window); // global read i + 2
-                });
+                        store_k_block_tile_to_lds(k_block_tile); // LDS write i + 1
+                        k_block_tile = load_tile(k_dram_window); // global read i + 2
+                    });
+                }
             }
 
             const auto v_prefetch = load_tile(v_dram_window); // prefetch load v tile
-            {                                                 // tail
+            if constexpr(k0_loops == 1)
+            { // single-K tail
+                block_sync_lds();
+                gemm_0(s_acc_gemm,
+                       get_slice_tile(q_tile, sequence<0, 0>{}, sequence<kM0, kQKHeaddim>{}),
+                       k_lds_window);
+                schedule_gemm0();
+            }
+            else
+            { // two-or-more K-slice tail
                 block_sync_lds();
                 gemm_0(s_acc_gemm,
                        get_slice_tile(q_tile,
