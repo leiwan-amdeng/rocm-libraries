@@ -3,6 +3,10 @@
 
 #pragma once
 
+#ifndef CK_TILE_SAGE_ATTN_FUSE_SCORE_EXP
+#define CK_TILE_SAGE_ATTN_FUSE_SCORE_EXP 1
+#endif
+
 #include "ck_tile/core.hpp"
 #include "ck_tile/ops/elementwise/unary_element_wise_operation.hpp"
 #include "ck_tile/ops/sageattention/block/block_sageattention_quant_scale_enum.hpp"
@@ -586,6 +590,15 @@ struct BlockSageAttentionPipelineQRKSVS
             }
             else
             {
+#if CK_TILE_SAGE_ATTN_FUSE_SCORE_EXP
+                // BLOCKSCALE fuse-score-exp path keeps raw int32->fp32 scores here and folds
+                // q/k descale plus sm_scale into the exp2 argument.  Other q-scale modes keep
+                // the existing pre-scale path.
+                if constexpr(QScaleEnum != BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
+                {
+                    s_acc = tile_elementwise_in(s_acc_element_func, s_acc);
+                }
+#else
                 // dequant: combine q_descale (in s_acc_element_func) with k_descale
                 auto s_acc_element_func_ = [&]() {
                     if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
@@ -596,6 +609,7 @@ struct BlockSageAttentionPipelineQRKSVS
                         return s_acc_element_func;
                 }();
                 s_acc = tile_elementwise_in(s_acc_element_func_, s_acc);
+#endif
             }
             // STAGE 2, scale_s, mask, softmax
             if constexpr(kPadSeqLenK || AttnMask::IsMasking)
@@ -635,6 +649,15 @@ struct BlockSageAttentionPipelineQRKSVS
                 sequence<1>{},
                 f_max,
                 -numeric<SMPLComputeDataType>::infinity()); // m_local = rowmax(S{j})
+
+#if CK_TILE_SAGE_ATTN_FUSE_SCORE_EXP
+            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
+            {
+                const auto score_dequant = type_convert<SMPLComputeDataType>(q_descale_value * k_descale);
+                tile_elementwise_inout(
+                    [score_dequant](auto& e0) { e0 *= score_dequant; }, m_local);
+            }
+#endif
             block_tile_reduce_sync(m_local, f_max, bool_constant<false>{});
 
             const auto m_old = m; // m{j-1}
@@ -712,7 +735,19 @@ struct BlockSageAttentionPipelineQRKSVS
                 }
                 sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
                     constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                    p_compute(i_j_idx)     = exp2(scale_s * s[i_j_idx] - row_max);
+#if CK_TILE_SAGE_ATTN_FUSE_SCORE_EXP
+                    if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
+                    {
+                        const auto score_scale = type_convert<SMPLComputeDataType>(
+                            scale_s * q_descale_value * k_descale);
+                        const auto exponent_shift = -row_max;
+                        p_compute(i_j_idx) = exp2(fmaf(s[i_j_idx], score_scale, exponent_shift));
+                    }
+                    else
+#endif
+                    {
+                        p_compute(i_j_idx) = exp2(scale_s * s[i_j_idx] - row_max);
+                    }
                 });
             });
 

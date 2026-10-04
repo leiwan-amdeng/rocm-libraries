@@ -975,7 +975,8 @@ struct SageAttnFwdKernel
                     smem_ptr,
                     nullptr,
                     k_descale_ptr,
-                    v_descale_ptr);
+                    v_descale_ptr,
+                    q_descale);
             }
             else if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP ||
                               QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD)
