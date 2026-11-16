@@ -302,7 +302,7 @@ class FmhaFwdApiTrait:
     @property
     def name(self) -> str:
         return (
-            f"{self.hdim}-{self.dtype}-{self.mode}-{self.bm0}-{self.bn0}-{self.bk0}-{self.bn1}-{self.bk1}-{self.bk0max}-"
+            f"{self.hdim}-{self.dtype}-{self.mode}-{self.bm0}-{self.bn0}-{self.bk0}-{self.bn0}-{self.bk1}-{self.bk0max}-"
             + f"{self.vlayout}-{self.logits}-{self.mask}-{self.bias}-{self.lse}-{self.dropout}-{self.qscale}-{self.spad}-{self.skpad}-{self.dpad}-{self.dvpad}-{self.skip}-{self.sink}"
         )
 
@@ -1290,7 +1290,9 @@ class KernelComponentFactoryGfx12(CompatibilityRuleFactory):
                 #(128, 128) : [FmhaFwdTileSize(128,  64,  64, 128,  64,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   2)], # 97.7 tlopfs
                 #(128, 128) : [FmhaFwdTileSize(256,  64,  64, 128,  64,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   2)], # 71.9 tlopfs
                 #(128, 128) : [FmhaFwdTileSize(128,  64,  32, 128,  64,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   2)], #  95.68
-                (128, 128) : [FmhaFwdTileSize(128, 128, 64, 128, 128, 128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6)], # best_nosplit_bk0_128_bk1_128_115t
+                (128, 128) : [FmhaFwdTileSize(128, 64, 64, 128, 64, 128, 8, 1, 1, 8, 1, 1, 16, 16, 16, 16, 16, 16, 2)], # best_grid_reorder_thr6_o2_107.15tflops
+
+
                 (192, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
                 (256, 256) : [FmhaFwdTileSize( 64,  64,  32, 256,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
             }  # fmt: skip

@@ -75,8 +75,25 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
 
 
 
-    static constexpr uint32_t DS_READ = 0x100; // Barrier for DS (data share) read
-    static constexpr uint32_t MFMA    = 0x008; // Barrier for MFMA (matrix multiply-accumulate)
+#ifndef CK_TILE_DENSEONLY_FMHA_LOOP_END_SCHED_HINT
+#define CK_TILE_DENSEONLY_FMHA_LOOP_END_SCHED_HINT 1
+#endif
+
+    static constexpr uint32_t VMEM_READ = 0x020; // Scheduler hint group for VMEM read
+    static constexpr uint32_t DS_READ   = 0x100; // Scheduler hint group for DS (LDS) read
+    static constexpr uint32_t DS_WRITE  = 0x200; // Scheduler hint group for DS (LDS) write
+    //static constexpr uint32_t MFMA      = 0x008; // Scheduler hint group for WMMA/MFMA
+
+    static constexpr uint32_t ALU        = 1 << 0;
+    static constexpr uint32_t VALU       = 1 << 1;
+    static constexpr uint32_t SALU       = 1 << 2;
+    static constexpr uint32_t MFMA       = 1 << 3;
+    static constexpr uint32_t VMEM       = 1 << 4;
+    //static constexpr uint32_t VMEM_READ  = 1 << 5;
+    static constexpr uint32_t VMEM_WRITE = 1 << 6;
+    static constexpr uint32_t DS         = 1 << 7;
+    //static constexpr uint32_t DS_READ    = 1 << 8;
+    //static constexpr uint32_t DS_WRITE   = 1 << 9;
 
     static_assert(!kPaddedVecLoadStore || (kPadHeadDimQ && kPadHeadDimV),
                   "padded vector load/store fast path only applies to padded head-dim kernels");
@@ -220,7 +237,9 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
         (void)variant;
         (void)variant_params;
         (void)block_indices;
-
+        (void)k_element_func;
+        (void)s_acc_element_func;
+        (void)q_element_func;
         static_assert(
             std::is_same_v<QDataType, remove_cvref_t<typename QDramBlockWindowTmp::DataType>> &&
                 std::is_same_v<KDataType, remove_cvref_t<typename KDramBlockWindowTmp::DataType>> &&
@@ -299,7 +318,7 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
         const auto num_sink_loop = integer_divide_ceil(sink_seq_end, kN0);
         const auto num_total_loop =
             integer_divide_ceil(seqlen_k_end - seqlen_k_start, kN0) + num_sink_loop;
-
+        //printf("kv_load_start %d ")
         // Dense-only: no mask/pad early-exit path.
 
         auto k_dram_block_window =
@@ -315,16 +334,26 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
                              {0, kv_load_start}, // TODO: hdim split?
                              Policy::template MakeVDramTileDistribution<Problem>());
 
-        auto q_tile = tile_elementwise_in(q_element_func, q);
+        auto q_tile = q;
 
         // prefetch K tile
         index_t i_total_loops      = 0;
-        constexpr index_t k0_loops = kQKHeaddim / kK0;
-        constexpr index_t k1_loops = kN0 / kK1;
+        constexpr index_t k0_loops = kQKHeaddim / kK0; // 1
+        constexpr index_t k1_loops = kN0 / kK1; // 1
+        auto v_prefetch = decltype(load_tile(v_dram_window)){};
         // Number of k0 iterations prefetched ahead of the current compute iteration.
-        constexpr index_t kK0PrefetchDepth = 2;
+        // constexpr index_t kK0PrefetchDepth = 2;
         static_assert(1 <= k0_loops);
         static_assert(1 <= k1_loops);
+
+        auto run_gemm_0 = [&](auto i_k0) {
+                // Dense-only: no padded head-dim partial-K tail.
+
+                auto q_slice = get_slice_tile(
+                    q_tile, sequence<0, i_k0 * kK0>{}, sequence<kM0, (i_k0 + 1) * kK0>{});
+                gemm_0(s_acc, q_slice, k_lds_window);
+        };
+
         do
         {
             // Dense-only: no K/V blockscale descale.
@@ -339,62 +368,27 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
 
             clear_tile(s_acc); // initialize C
             // Dense-only: no bias tile load.
-
-            auto run_gemm_0 = [&](auto i_k0) {
-                // Dense-only: no padded head-dim partial-K tail.
-
-                auto q_slice = get_slice_tile(
-                    q_tile, sequence<0, i_k0 * kK0>{}, sequence<kM0, (i_k0 + 1) * kK0>{});
-                gemm_0(s_acc, q_slice, k_lds_window);
-            };
-
-            auto v_prefetch = decltype(load_tile(v_dram_window)){};
             // gfx12 dense-only path: issue V prefetch after QK GEMM tail (baseline-good).
-            if constexpr(k0_loops == 1)
+            //if constexpr(k0_loops == 1)
             {
                 auto k_block_tile = load_tile(k_dram_window);
-                store_tile(k_lds_window, tile_elementwise_in(k_element_func, k_block_tile));
+                store_tile(k_lds_window, k_block_tile);
+                
                 block_sync_lds();
+                
                 run_gemm_0(number<0>{});
+                
             }
-            else
-            {
-                static_assert(kK0PrefetchDepth <= k0_loops);
-                auto k_block_tile = load_tile(k_dram_window);
-                move_tile_window(k_dram_window, {0, kK0});
-                store_tile(k_lds_window, tile_elementwise_in(k_element_func, k_block_tile));
-                k_block_tile = load_tile(k_dram_window);
-
-                if constexpr(k0_loops > kK0PrefetchDepth)
-                {
-                    static_for<0, k0_loops - kK0PrefetchDepth, 1>{}([&](auto i_k0) {
-                        block_sync_lds();
-                        run_gemm_0(number<i_k0>{});
-                        block_sync_lds();
-                        move_tile_window(k_dram_window, {0, kK0});
-
-                        store_tile(
-                            k_lds_window,
-                            tile_elementwise_in(k_element_func, k_block_tile)); // LDS write i + 1
-                        k_block_tile = load_tile(k_dram_window);                // global read i + 2
-                    });
-                }
-
-                { // tail
-                    block_sync_lds();
-                    run_gemm_0(number<k0_loops - kK0PrefetchDepth>{});
-                    block_sync_lds();
-
-                    store_tile(k_lds_window, tile_elementwise_in(k_element_func, k_block_tile));
-
-                    block_sync_lds();
-
-                    run_gemm_0(number<k0_loops - 1>{});
-                }
-            }
+            //prefetch v cache
             load_tile(v_prefetch, v_dram_window);
+            // auto v_shuffle_tmp = make_static_distributed_tensor<VDataType>(
+            //         Policy::template MakeShuffledVRegBlockDescriptor<Problem>());
+            // shuffle_tile(v_shuffle_tmp, v_prefetch);
+            //store_tile(v_lds_window, v_shuffle_tmp);
+            // stub
+            //store_tile(v_lds_window, v_prefetch);
             // STAGE 2, scale_s, add bias, mask, softmax
-            s_acc = tile_elementwise_in(s_acc_element_func, s_acc);
+            // s_acc = tile_elementwise_in(s_acc_element_func, s_acc);
             // Dense-only full-sequence/no-mask path: no seq-k padding or masking.
             const auto s = cast_tile<SMPLComputeDataType>(s_acc); // S{j}
             auto m_local = block_tile_reduce<SMPLComputeDataType>(
@@ -426,8 +420,7 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
             // exceed the FP8 representable range and saturate, corrupting the
             // P*V GEMM. Disable skip for all FP8 paths (threshold 0).
             static constexpr SMPLComputeDataType kRescaleThreshold =
-                type_convert<SMPLComputeDataType>(
-5.0f);
+                type_convert<SMPLComputeDataType>(5.0f);
 
             // Per-row stabilizer: m_old for skip rows, m_j for rescale rows.
             auto m_stab =
@@ -498,17 +491,18 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
 
             // Dense-only: no dropout.
 
-            block_sync_lds();
-            auto v_shuffle_tmp = make_static_distributed_tensor<VDataType>(
-                Policy::template MakeShuffledVRegBlockDescriptor<Problem>());
-            shuffle_tile(v_shuffle_tmp, v_prefetch);
-            store_tile(v_lds_window, v_shuffle_tmp); // store the prefetch
-            // store_tile(v_lds_window, v_prefetch); // store the prefetch
-
-
+            const auto p = cast_tile<PDataType>(p_compute);
+            
+            // auto v_shuffle_tmp = make_static_distributed_tensor<VDataType>(
+            //     Policy::template MakeShuffledVRegBlockDescriptor<Problem>());
+            // shuffle_tile(v_shuffle_tmp, v_prefetch);
+            // store_tile(v_lds_window, v_shuffle_tmp); // store the prefetch
+            store_tile(v_lds_window, v_prefetch); // store the prefetch
+            
+            
             move_tile_window(v_dram_window, {0, kK1});
 
-            const auto p = cast_tile<PDataType>(p_compute);
+            
 
             // STAGE 3, KV gemm
             // Dense-only: accumulate PV directly into o_acc.
@@ -525,20 +519,17 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
             };
 
             // Dense-only d_v=128 with k1_loops=2: always run the pre-tail PV stage.
-            static_for<0, k1_loops - 1, 1>{}([&](auto i_k1) {
-                const auto v = load_tile(v_dram_window); // load next v
-                block_sync_lds();
-                run_gemm_1(number<i_k1>{});
-                block_sync_lds();
-                auto v_shuffle_next = make_static_distributed_tensor<VDataType>(
-                    Policy::template MakeShuffledVRegBlockDescriptor<Problem>());
-                shuffle_tile(v_shuffle_next, v);
-                store_tile(v_lds_window, v_shuffle_next); // store next v
-
-                //store_tile(v_lds_window, v); // store next v
-
-                move_tile_window(v_dram_window, {0, kK1});
-            });
+            // static_for<0, k1_loops - 1, 1>{}([&](auto i_k1) {
+            //     const auto v = load_tile(v_dram_window); // load next v
+            //     block_sync_lds();
+            //     run_gemm_1(number<i_k1>{});
+            //     block_sync_lds();
+            //     auto v_shuffle_next = make_static_distributed_tensor<VDataType>(
+            //         Policy::template MakeShuffledVRegBlockDescriptor<Problem>());
+            //     shuffle_tile(v_shuffle_next, v);
+            //     store_tile(v_lds_window, v_shuffle_next); // store next v
+            //     move_tile_window(v_dram_window, {0, kK1});
+            // });
 
             // move K tile windows; DenseOnly has no sink path.
             move_tile_window(k_dram_block_window, {kN0, 0});
@@ -547,13 +538,34 @@ struct BlockFmhaPipelineQRKSVSDenseOnly
             {
                 block_sync_lds();
                 run_gemm_1(number<k1_loops - 1>{});
-                block_sync_lds();
+                // block_sync_lds();
             }
+
+#if CK_TILE_DENSEONLY_FMHA_LOOP_END_SCHED_HINT
+            // Experimental compact scheduler hints at the loop latch only.
+            // This is intentionally kept in one place (instead of sprinkling hints
+            // around every load/store/compute phase) so ATT/ISA changes are easy to study.
+
+            // These are compiler scheduling hints only; they are NOT memory waits or block syncs.
+            // __builtin_amdgcn_sched_group_barrier(VMEM_READ, 1, 0);   // PV/QK LDS reads
+            // __builtin_amdgcn_sched_group_barrier(DS_WRITE, 1, 0);  // V/K LDS stores
+            // __builtin_amdgcn_sched_group_barrier(DS_READ, 1, 0);   // PV/QK LDS reads
+
+            // __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);      // WMMA tail
+            
+            // __builtin_amdgcn_sched_group_barrier(VMEM_READ, 1, 0);   // PV/QK LDS reads
+
+            // __builtin_amdgcn_sched_group_barrier(VALU, 1, 0);   // VALU
+
+            // __builtin_amdgcn_sched_group_barrier(DS_WRITE, 1, 0);  // V/K LDS stores
+            // __builtin_amdgcn_sched_group_barrier(DS_READ, 1, 0);   // PV/QK LDS reads
+            // __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);      // WMMA tail
+#endif
             // Dense-only: no blockscale O accumulation merge.
         } while(++i_total_loops < num_total_loop);
 
         // Dense-only: no LSE store.
-
+        
         // finally, O
         constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
 
